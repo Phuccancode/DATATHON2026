@@ -15,15 +15,39 @@ import pandas as pd
 # Deterministic date-derived columns (never forecast as exogenous drivers).
 CALENDAR_BASE_COLS = [
     "dow",
+    "day_of_week",
     "is_weekend",
     "day",
+    "day_of_month",
     "month",
     "quarter",
     "weekofyear",
     "dayofyear",
+    "day_of_year",
     "is_month_start",
     "is_month_end",
+    "days_since_start",
+    "days_to_tet",
 ]
+
+# Tet (Lunar New Year) Gregorian dates needed for this competition window.
+# Keep one year ahead (2025) so days after Tet-2024 still map to the next Tet.
+TET_LUNAR_NEW_YEAR = {
+    2012: "2012-01-23",
+    2013: "2013-02-10",
+    2014: "2014-01-31",
+    2015: "2015-02-19",
+    2016: "2016-02-08",
+    2017: "2017-01-28",
+    2018: "2018-02-16",
+    2019: "2019-02-05",
+    2020: "2020-01-25",
+    2021: "2021-02-12",
+    2022: "2022-02-01",
+    2023: "2023-01-22",
+    2024: "2024-02-10",
+    2025: "2025-01-29",
+}
 
 # Curated high-signal exogenous drivers (ranked from historical train set).
 BEST_DRIVER_CANDIDATES = [
@@ -165,18 +189,47 @@ def date_grid(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
 
 
 
-def add_calendar_features(df: pd.DataFrame, date_col: str = "Date") -> pd.DataFrame:
+def days_to_next_tet(ts: pd.Timestamp) -> int:
+    d = pd.Timestamp(ts).normalize()
+    for y in [d.year - 1, d.year, d.year + 1, d.year + 2]:
+        if y in TET_LUNAR_NEW_YEAR:
+            tet_day = pd.Timestamp(TET_LUNAR_NEW_YEAR[y])
+            if tet_day >= d:
+                return int((tet_day - d).days)
+
+    future_tet = [pd.Timestamp(v) for v in TET_LUNAR_NEW_YEAR.values() if pd.Timestamp(v) >= d]
+    if future_tet:
+        return int((min(future_tet) - d).days)
+    return 0
+
+
+
+def add_calendar_features(
+    df: pd.DataFrame,
+    date_col: str = "Date",
+    start_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     out = df.copy()
     d = pd.to_datetime(out[date_col])
+    if start_date is None:
+        start_ts = pd.Timestamp(d.min()).normalize()
+    else:
+        start_ts = pd.Timestamp(start_date).normalize()
+
     out["dow"] = d.dt.dayofweek
+    out["day_of_week"] = out["dow"]
     out["is_weekend"] = d.dt.dayofweek.isin([5, 6]).astype(int)
     out["day"] = d.dt.day
+    out["day_of_month"] = out["day"]
     out["month"] = d.dt.month
     out["quarter"] = d.dt.quarter
     out["weekofyear"] = d.dt.isocalendar().week.astype(int)
     out["dayofyear"] = d.dt.dayofyear
+    out["day_of_year"] = out["dayofyear"]
     out["is_month_start"] = d.dt.is_month_start.astype(int)
     out["is_month_end"] = d.dt.is_month_end.astype(int)
+    out["days_since_start"] = (d.dt.normalize() - start_ts).dt.days.astype(int)
+    out["days_to_tet"] = d.apply(days_to_next_tet).astype(int)
     return out
 
 
@@ -528,7 +581,7 @@ def build_daily_feature_mart(bundle: DataBundle) -> pd.DataFrame:
     mart[feature_cols] = mart[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
 
     # Calendar & Fourier
-    mart = add_calendar_features(mart, "Date")
+    mart = add_calendar_features(mart, "Date", start_date=start)
     mart = add_fourier(mart, "dayofyear", max_k=5)
 
     return mart.sort_values("Date").reset_index(drop=True)
@@ -559,10 +612,10 @@ def apply_time_safety_shifts(mart: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 
 
-def build_calendar_matrix(dates: pd.Series) -> np.ndarray:
+def build_calendar_matrix(dates: pd.Series, start_date: pd.Timestamp | None = None) -> np.ndarray:
     d = pd.to_datetime(dates)
     out = pd.DataFrame({"Date": d})
-    out = add_calendar_features(out, "Date")
+    out = add_calendar_features(out, "Date", start_date=start_date)
     out = add_fourier(out, "dayofyear", max_k=3)
 
     # One-hot minimal sets
@@ -571,6 +624,8 @@ def build_calendar_matrix(dates: pd.Series) -> np.ndarray:
         X.append((out["dow"].values == k).astype(float))
     for m in range(2, 13):
         X.append((out["month"].values == m).astype(float))
+    for col in ["day_of_month", "day_of_year", "day_of_week", "days_since_start", "days_to_tet"]:
+        X.append(out[col].values.astype(float))
     for col in [c for c in out.columns if c.startswith("sin_") or c.startswith("cos_")]:
         X.append(out[col].values.astype(float))
     return np.column_stack(X)
@@ -618,7 +673,7 @@ def ridge_recursive_with_lags(history: np.ndarray, history_dates: pd.Series, fut
     d_hist = pd.to_datetime(history_dates).reset_index(drop=True)
     y = np.asarray(history, dtype=float)
 
-    cal_X = build_calendar_matrix(d_hist)
+    cal_X = build_calendar_matrix(d_hist, start_date=d_hist.iloc[0])
     rows = []
     target = []
     for i in range(max_lag, len(y)):
@@ -636,7 +691,7 @@ def ridge_recursive_with_lags(history: np.ndarray, history_dates: pd.Series, fut
 
     hist = list(y)
     future_idx = pd.to_datetime(future_dates).reset_index(drop=True)
-    future_cal = build_calendar_matrix(future_idx)
+    future_cal = build_calendar_matrix(future_idx, start_date=d_hist.iloc[0])
     preds: list[float] = []
 
     for i, d in enumerate(future_idx):
@@ -930,21 +985,28 @@ def recursive_target_predict(
     fut = future_df.sort_values("Date")
 
     y_hist = list(hist[target_col].astype(float).values)
+    hist_start_date = pd.to_datetime(hist["Date"].iloc[0]).normalize()
     preds: list[float] = []
 
     for _, row in fut.iterrows():
         d = pd.to_datetime(row["Date"])
+        d_norm = d.normalize()
 
         feat = {
             "dow": int(d.dayofweek),
+            "day_of_week": int(d.dayofweek),
             "is_weekend": int(d.dayofweek in [5, 6]),
             "day": int(d.day),
+            "day_of_month": int(d.day),
             "month": int(d.month),
             "quarter": int((d.month - 1) // 3 + 1),
             "weekofyear": int(d.isocalendar().week),
             "dayofyear": int(d.dayofyear),
+            "day_of_year": int(d.dayofyear),
             "is_month_start": int(d.is_month_start),
             "is_month_end": int(d.is_month_end),
+            "days_since_start": int((d_norm - hist_start_date).days),
+            "days_to_tet": int(days_to_next_tet(d)),
         }
         for k in range(1, 6):
             feat[f"sin_{k}"] = float(np.sin(2.0 * np.pi * k * d.dayofyear / 365.25))
