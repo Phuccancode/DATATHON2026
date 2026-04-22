@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,49 +48,59 @@ TET_LUNAR_NEW_YEAR = {
     2025: "2025-01-29",
 }
 
-# Curated high-signal exogenous drivers (ranked from historical train set).
-BEST_DRIVER_CANDIDATES = [
-    "units_sold",
+# Core business drivers kept regardless of auto ranking.
+CORE_DRIVER_FEATURES = [
     "order_count",
-    "shipped_count",
-    "inv_units_received",
-    "inv_units_sold",
-    "review_count",
-    "sessions",
-    "page_views",
-    "unique_visitors",
-    "refund_amount",
-    "inv_days_of_supply",
-    "return_count",
-    "return_qty",
-    "segment_mix_Performance",
-    "inv_sell_through_rate",
-    "inv_overstock_flag",
-    "segment_mix_Everyday",
-    "inv_stock_on_hand",
-    "segment_mix_Balanced",
-    "region_order_share_West",
-    "refund_rate",
-    "category_mix_Streetwear",
-    "category_mix_Outdoor",
-    "inv_stockout_days",
-    "new_signup_count",
-    "region_order_share_East",
+    "units_sold",
     "avg_unit_price",
-    "avg_payment_value",
-    "avg_shipping_fee",
     "discount_rate_avg",
-    "promo_depth_proxy",
-    "inv_fill_rate",
-    "inv_stockout_flag",
-    "category_mix_Casual",
+    "promo_used_rate",
     "active_promo_count",
+    "promo_depth_proxy",
+    "sessions",
+    "unique_visitors",
+    "page_views",
+    "inv_stock_on_hand",
+    "inv_units_sold",
+    "inv_days_of_supply",
+    "inv_fill_rate",
+    "return_qty",
+    "refund_amount",
+    "review_count",
+    "new_signup_count",
+    # Derived interactions
+    "conversion_rate_proxy",
+    "items_per_order",
+    "views_per_session",
+    "orders_per_visitor",
+    "traffic_quality_proxy",
+    "promo_pressure_index",
+    "effective_promo_pressure",
+    "inventory_pressure_index",
+    "availability_index",
+    "stock_cover_ratio",
+    "return_rate_qty",
+    "revenue_proxy",
+    "net_demand_proxy",
 ]
 
-# CatBoost device probe cache.
-_CATBOOST_GPU_AVAILABLE: bool | None = None
-_CATBOOST_GPU_PROBE_LOGGED = False
+# Share-level features below are often noisy in long-horizon forecasts.
+NOISY_DRIVER_PREFIXES = [
+    "order_status_share_",
+    "order_source_share_",
+    "device_share_",
+    "payment_method_share_",
+    "return_reason_share_",
+    "traffic_source_share_",
+    "acq_channel_share_",
+]
 
+# Conservative auto-pruning of exogenous drivers:
+# 1) rank by model importance, 2) validate by quick CV, 3) only prune when metrics do not degrade.
+AUTO_DRIVER_MIN_KEEP = 12
+AUTO_DRIVER_KEEP_RATIO = 0.45
+AUTO_DRIVER_CV_TOL = 0.0015
+PIPELINE_CACHE_VERSION = "v6_lgb_native_feature_refresh"
 
 # -----------------------------
 # Utility
@@ -549,6 +558,41 @@ def aggregate_web_traffic_daily(web_traffic: pd.DataFrame) -> pd.DataFrame:
     return core.merge(piv, on="Date", how="left")
 
 
+def add_derived_business_features(mart: pd.DataFrame) -> pd.DataFrame:
+    out = mart.copy()
+    if "order_count" in out.columns and "sessions" in out.columns:
+        out["conversion_rate_proxy"] = safe_div(out["order_count"], out["sessions"])
+    if "units_sold" in out.columns and "order_count" in out.columns:
+        out["items_per_order"] = safe_div(out["units_sold"], out["order_count"])
+    if "page_views" in out.columns and "sessions" in out.columns:
+        out["views_per_session"] = safe_div(out["page_views"], out["sessions"])
+    if "order_count" in out.columns and "unique_visitors" in out.columns:
+        out["orders_per_visitor"] = safe_div(out["order_count"], out["unique_visitors"])
+    if "avg_session_duration_sec" in out.columns and "bounce_rate" in out.columns:
+        out["traffic_quality_proxy"] = out["avg_session_duration_sec"].astype(float) * (1.0 - out["bounce_rate"].astype(float))
+
+    if "active_promo_count" in out.columns and "promo_depth_proxy" in out.columns:
+        out["promo_pressure_index"] = out["active_promo_count"].astype(float) * out["promo_depth_proxy"].astype(float)
+    if "promo_pressure_index" in out.columns and "stackable_share" in out.columns:
+        out["effective_promo_pressure"] = out["promo_pressure_index"].astype(float) * (1.0 + out["stackable_share"].astype(float))
+
+    if "inv_stockout_days" in out.columns and "inv_fill_rate" in out.columns:
+        out["inventory_pressure_index"] = out["inv_stockout_days"].astype(float) * (1.0 - out["inv_fill_rate"].astype(float))
+    if "inv_fill_rate" in out.columns and "inv_stockout_flag" in out.columns:
+        out["availability_index"] = out["inv_fill_rate"].astype(float) * (1.0 - out["inv_stockout_flag"].astype(float))
+    if "inv_stock_on_hand" in out.columns and "inv_units_sold" in out.columns:
+        out["stock_cover_ratio"] = safe_div(out["inv_stock_on_hand"], out["inv_units_sold"] + 1.0)
+
+    if "return_qty" in out.columns and "units_sold" in out.columns:
+        out["return_rate_qty"] = safe_div(out["return_qty"], out["units_sold"])
+    if "units_sold" in out.columns and "avg_unit_price" in out.columns:
+        out["revenue_proxy"] = out["units_sold"].astype(float) * out["avg_unit_price"].astype(float)
+    if "units_sold" in out.columns and "return_rate_qty" in out.columns:
+        out["net_demand_proxy"] = out["units_sold"].astype(float) * (1.0 - out["return_rate_qty"].astype(float))
+
+    return out
+
+
 
 def build_daily_feature_mart(bundle: DataBundle) -> pd.DataFrame:
     sales = bundle.sales[["Date", "Revenue", "COGS"]].copy().sort_values("Date")
@@ -575,6 +619,8 @@ def build_daily_feature_mart(bundle: DataBundle) -> pd.DataFrame:
     mart = grid.merge(sales, on="Date", how="left")
     for f in feats:
         mart = mart.merge(f, on="Date", how="left")
+
+    mart = add_derived_business_features(mart)
 
     # Fill missing feature values; keep targets untouched.
     feature_cols = [c for c in mart.columns if c not in ["Date", "Revenue", "COGS"]]
@@ -722,6 +768,53 @@ def walk_forward_splits(n_rows: int, horizon: int, n_folds: int = 2) -> list[tup
 
 
 
+def seasonal_cv_target(
+    train_df: pd.DataFrame,
+    target_col: str,
+    horizon: int,
+    n_folds: int,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    train_df = train_df.sort_values("Date").reset_index(drop=True)
+    splits = walk_forward_splits(len(train_df), horizon, n_folds=n_folds)
+    all_true: list[np.ndarray] = []
+    all_pred: list[np.ndarray] = []
+    for _, tr_end, va_end in splits:
+        tr = train_df.iloc[:tr_end].copy()
+        va = train_df.iloc[tr_end:va_end].copy()
+        p = seasonal_naive_recursive(
+            history=tr[target_col].astype(float).values,
+            history_dates=tr["Date"],
+            future_dates=va["Date"],
+        )
+        all_true.append(va[target_col].astype(float).values)
+        all_pred.append(np.asarray(p, dtype=float))
+
+    y_true = np.concatenate(all_true) if all_true else np.array([])
+    y_pred = np.concatenate(all_pred) if all_pred else np.array([])
+    return metric_pack(y_true, y_pred), y_true, y_pred
+
+
+def best_linear_blend(
+    y_true: np.ndarray,
+    pred_a: np.ndarray,
+    pred_b: np.ndarray,
+) -> tuple[float, dict[str, float], np.ndarray]:
+    best_w = 1.0
+    best_metrics = metric_pack(y_true, pred_a)
+    best_pred = np.asarray(pred_a, dtype=float)
+    for w in np.linspace(0.0, 1.0, 21):
+        pred = np.clip(w * pred_a + (1.0 - w) * pred_b, 0.0, None)
+        m = metric_pack(y_true, pred)
+        better = (m["rmse"] < best_metrics["rmse"]) or (
+            np.isclose(m["rmse"], best_metrics["rmse"]) and m["mae"] < best_metrics["mae"]
+        )
+        if better:
+            best_w = float(w)
+            best_metrics = m
+            best_pred = pred
+    return best_w, best_metrics, best_pred
+
+
 def evaluate_driver_models(y: np.ndarray, dates: pd.Series, horizon: int, n_folds: int = 2) -> tuple[str, dict[str, float], dict[str, float]]:
     splits = walk_forward_splits(len(y), horizon, n_folds=n_folds)
     if not splits:
@@ -824,6 +917,40 @@ class RidgeFallbackModel:
         return X_arr @ self.beta
 
 
+class LightGBMNativeModel:
+    def __init__(self, params: dict[str, object], n_estimators: int):
+        self.params = params
+        self.n_estimators = int(n_estimators)
+        self.booster = None
+        self.feature_importances_: np.ndarray | None = None
+
+    def fit(self, X, y) -> "LightGBMNativeModel":
+        import lightgbm as lgb
+
+        X_arr = np.asarray(X, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
+        train_set = lgb.Dataset(X_arr, label=y_arr, free_raw_data=False)
+        self.booster = lgb.train(
+            params=self.params,
+            train_set=train_set,
+            num_boost_round=self.n_estimators,
+        )
+        self.feature_importances_ = np.asarray(
+            self.booster.feature_importance(importance_type="gain"),
+            dtype=float,
+        )
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        if self.booster is None:
+            raise RuntimeError("Model not fitted")
+        X_arr = np.asarray(X, dtype=float)
+        return np.asarray(self.booster.predict(X_arr), dtype=float)
+
+
+_LGBM_FAILURE_LOGGED = False
+
+
 
 def build_target_training_matrix(
     df: pd.DataFrame,
@@ -843,6 +970,18 @@ def build_target_training_matrix(
         out[f"lag_{target_col}_{lg}"] = out[target_col].shift(lg)
     for w in roll_windows:
         out[f"roll_{target_col}_{w}"] = out[target_col].shift(1).rolling(w).mean()
+        out[f"roll_std_{target_col}_{w}"] = out[target_col].shift(1).rolling(w).std()
+
+    for span in [7, 30, 90]:
+        out[f"ewm_{target_col}_{span}"] = out[target_col].shift(1).ewm(span=span, adjust=False).mean()
+
+    if f"lag_{target_col}_1" in out.columns and f"lag_{target_col}_7" in out.columns:
+        out[f"mom_{target_col}_1_7"] = out[f"lag_{target_col}_1"] - out[f"lag_{target_col}_7"]
+    if f"lag_{target_col}_7" in out.columns and f"lag_{target_col}_28" in out.columns:
+        out[f"mom_{target_col}_7_28"] = out[f"lag_{target_col}_7"] - out[f"lag_{target_col}_28"]
+        out[f"ratio_{target_col}_7_28"] = safe_div(out[f"lag_{target_col}_7"], out[f"lag_{target_col}_28"])
+    if f"lag_{target_col}_28" in out.columns and f"lag_{target_col}_364" in out.columns:
+        out[f"ratio_{target_col}_28_364"] = safe_div(out[f"lag_{target_col}_28"], out[f"lag_{target_col}_364"])
 
     use_cols = [
         *CALENDAR_BASE_COLS,
@@ -851,6 +990,9 @@ def build_target_training_matrix(
     use_cols += driver_cols
     use_cols += [f"lag_{target_col}_{lg}" for lg in lag_cols]
     use_cols += [f"roll_{target_col}_{w}" for w in roll_windows]
+    use_cols += [f"roll_std_{target_col}_{w}" for w in roll_windows]
+    use_cols += [f"ewm_{target_col}_{span}" for span in [7, 30, 90]]
+    use_cols += [c for c in out.columns if c.startswith(f"mom_{target_col}_") or c.startswith(f"ratio_{target_col}_")]
 
     model_df = out[use_cols + [target_col]].dropna().copy()
     X = model_df[use_cols].astype(float)
@@ -860,115 +1002,62 @@ def build_target_training_matrix(
 
 
 def try_build_lgbm(params: dict[str, object], seed: int = 42):
+    global _LGBM_FAILURE_LOGGED
     try:
-        from lightgbm import LGBMRegressor
+        import lightgbm as _  # noqa: F401
 
         p = {
-            "n_estimators": int(params.get("n_estimators", 700)),
+            "objective": "regression",
+            "metric": "l2",
             "learning_rate": float(params.get("learning_rate", 0.03)),
             "num_leaves": int(params.get("num_leaves", 63)),
             "max_depth": int(params.get("max_depth", -1)),
-            "min_child_samples": int(params.get("min_child_samples", 20)),
-            "subsample": float(params.get("subsample", 0.9)),
-            "colsample_bytree": float(params.get("colsample_bytree", 0.9)),
-            "reg_lambda": float(params.get("reg_lambda", 5.0)),
-            "random_state": seed,
+            "min_data_in_leaf": int(params.get("min_child_samples", 20)),
+            "feature_fraction": float(params.get("colsample_bytree", 0.9)),
+            "bagging_fraction": float(params.get("subsample", 0.9)),
+            "bagging_freq": 1,
+            "lambda_l2": float(params.get("reg_lambda", 5.0)),
+            "seed": seed,
             "verbosity": -1,
+            "force_col_wise": True,
         }
-        return LGBMRegressor(**p), "lightgbm"
-    except Exception:
+        n_estimators = int(params.get("n_estimators", 700))
+        return LightGBMNativeModel(params=p, n_estimators=n_estimators), "lightgbm_native"
+    except Exception as ex:
+        if not _LGBM_FAILURE_LOGGED:
+            log(f"[Model] LightGBM unavailable, fallback to ridge: {type(ex).__name__}: {ex}")
+            _LGBM_FAILURE_LOGGED = True
         return RidgeFallbackModel(l2=8.0), "ridge_fallback"
 
 
 
-def try_build_catboost(params: dict[str, object], seed: int = 42):
-    try:
-        from catboost import CatBoostRegressor
-
-        def catboost_device_mode() -> str:
-            mode = str(os.environ.get("PART3_CATBOOST_DEVICE", "auto")).strip().lower()
-            return mode if mode in {"auto", "cpu", "gpu"} else "auto"
-
-        def can_use_catboost_gpu() -> bool:
-            global _CATBOOST_GPU_AVAILABLE, _CATBOOST_GPU_PROBE_LOGGED
-            mode = catboost_device_mode()
-            if mode == "cpu":
-                return False
-            if _CATBOOST_GPU_AVAILABLE is not None:
-                return _CATBOOST_GPU_AVAILABLE
-
-            try:
-                # Tiny probe to validate CUDA runtime once per process.
-                probe = CatBoostRegressor(
-                    iterations=1,
-                    depth=2,
-                    learning_rate=0.1,
-                    loss_function="RMSE",
-                    verbose=False,
-                    task_type="GPU",
-                    devices="0",
-                )
-                probe.fit(np.array([[0.0], [1.0], [2.0], [3.0]], dtype=float), np.array([0.0, 1.0, 2.0, 3.0], dtype=float))
-                _CATBOOST_GPU_AVAILABLE = True
-            except Exception as exc:
-                _CATBOOST_GPU_AVAILABLE = False
-                if not _CATBOOST_GPU_PROBE_LOGGED:
-                    if mode == "gpu":
-                        log(f"[CatBoost] GPU requested but unavailable ({exc.__class__.__name__}); fallback to CPU.")
-                    else:
-                        log(f"[CatBoost] GPU unavailable ({exc.__class__.__name__}); using CPU backend.")
-                    _CATBOOST_GPU_PROBE_LOGGED = True
-
-            return _CATBOOST_GPU_AVAILABLE
-
-        p = {
-            "iterations": int(params.get("iterations", 900)),
-            "learning_rate": float(params.get("learning_rate", 0.03)),
-            "depth": int(params.get("depth", 8)),
-            "l2_leaf_reg": float(params.get("l2_leaf_reg", 6.0)),
-            "bagging_temperature": float(params.get("bagging_temperature", 1.0)),
-            "loss_function": "RMSE",
-            "random_seed": seed,
-            "verbose": False,
-        }
-        use_gpu = can_use_catboost_gpu()
-        if use_gpu:
-            p["task_type"] = "GPU"
-            p["devices"] = "0"
-        return CatBoostRegressor(**p), ("catboost_gpu" if use_gpu else "catboost_cpu")
-    except Exception:
-        return RidgeFallbackModel(l2=10.0), "ridge_fallback"
-
-
-
-def random_param_samples(model_type: str, n_trials: int, rng: np.random.Generator) -> list[dict[str, object]]:
+def random_param_samples(n_trials: int, rng: np.random.Generator) -> list[dict[str, object]]:
     params = []
     for _ in range(n_trials):
-        if model_type == "lgbm":
-            params.append(
-                {
-                    "n_estimators": int(rng.integers(400, 1200)),
-                    "learning_rate": float(rng.uniform(0.01, 0.08)),
-                    "num_leaves": int(rng.integers(31, 127)),
-                    "max_depth": int(rng.choice([-1, 6, 8, 10, 12])),
-                    "min_child_samples": int(rng.integers(10, 60)),
-                    "subsample": float(rng.uniform(0.7, 1.0)),
-                    "colsample_bytree": float(rng.uniform(0.7, 1.0)),
-                    "reg_lambda": float(rng.uniform(0.5, 20.0)),
-                }
-            )
-        else:
-            params.append(
-                {
-                    "iterations": int(rng.integers(500, 1400)),
-                    "learning_rate": float(rng.uniform(0.01, 0.08)),
-                    "depth": int(rng.integers(5, 11)),
-                    "l2_leaf_reg": float(rng.uniform(1.0, 20.0)),
-                    "bagging_temperature": float(rng.uniform(0.0, 3.0)),
-                }
-            )
+        params.append(
+            {
+                "n_estimators": int(rng.integers(400, 1200)),
+                "learning_rate": float(rng.uniform(0.01, 0.08)),
+                "num_leaves": int(rng.integers(31, 127)),
+                "max_depth": int(rng.choice([-1, 6, 8, 10, 12])),
+                "min_child_samples": int(rng.integers(10, 60)),
+                "subsample": float(rng.uniform(0.7, 1.0)),
+                "colsample_bytree": float(rng.uniform(0.7, 1.0)),
+                "reg_lambda": float(rng.uniform(0.5, 20.0)),
+            }
+        )
     return params
 
+
+
+def ewm_last(values: list[float], span: int) -> float:
+    if not values:
+        return 0.0
+    alpha = 2.0 / (span + 1.0)
+    out = float(values[0])
+    for v in values[1:]:
+        out = alpha * float(v) + (1.0 - alpha) * out
+    return float(out)
 
 
 def recursive_target_predict(
@@ -1019,6 +1108,15 @@ def recursive_target_predict(
             feat[f"lag_{target_col}_{lg}"] = float(y_hist[-lg])
         for w in roll_windows:
             feat[f"roll_{target_col}_{w}"] = float(np.mean(y_hist[-w:]))
+            feat[f"roll_std_{target_col}_{w}"] = float(np.std(y_hist[-w:], ddof=0))
+
+        for span in [7, 30, 90]:
+            feat[f"ewm_{target_col}_{span}"] = ewm_last(y_hist, span=span)
+
+        feat[f"mom_{target_col}_1_7"] = float(y_hist[-1] - y_hist[-7])
+        feat[f"mom_{target_col}_7_28"] = float(y_hist[-7] - y_hist[-28])
+        feat[f"ratio_{target_col}_7_28"] = float(y_hist[-7] / y_hist[-28]) if y_hist[-28] != 0 else 0.0
+        feat[f"ratio_{target_col}_28_364"] = float(y_hist[-28] / y_hist[-364]) if y_hist[-364] != 0 else 0.0
 
         X_row = pd.DataFrame([{c: feat[c] for c in feature_cols}], columns=feature_cols)
         pred = float(model.predict(X_row)[0])
@@ -1101,7 +1199,6 @@ def tune_model(
     driver_cols: list[str],
     lag_cols: list[int],
     roll_windows: list[int],
-    model_type: str,
     horizon: int,
     n_folds: int,
     n_trials: int,
@@ -1109,11 +1206,7 @@ def tune_model(
     exog_forecast_cache: dict[tuple[int, int, int, str], np.ndarray] | None = None,
 ) -> tuple[dict[str, object], dict[str, float], np.ndarray, np.ndarray, str]:
     rng = np.random.default_rng(seed)
-
-    if model_type == "lgbm":
-        builder = lambda p: try_build_lgbm(p, seed=seed)
-    else:
-        builder = lambda p: try_build_catboost(p, seed=seed)
+    builder = lambda p: try_build_lgbm(p, seed=seed)
 
     best_params: dict[str, object] = {}
     best_metrics = {"mae": float("inf"), "rmse": float("inf"), "r2": -float("inf")}
@@ -1123,11 +1216,11 @@ def tune_model(
     shared_cache = exog_forecast_cache if exog_forecast_cache is not None else {}
 
     # Ensure at least one run with defaults
-    candidates = [{}] + random_param_samples(model_type, n_trials=max(0, n_trials - 1), rng=rng)
+    candidates = [{}] + random_param_samples(n_trials=max(0, n_trials - 1), rng=rng)
 
     for i, p in enumerate(candidates, start=1):
         t_trial = time.perf_counter()
-        log(f"[{target_col}] {model_type} trial {i}/{len(candidates)} started")
+        log(f"[{target_col}] lgbm trial {i}/{len(candidates)} started")
         metrics, y_true, y_pred = walk_forward_cv_target(
             train_df=train_df,
             target_col=target_col,
@@ -1139,11 +1232,11 @@ def tune_model(
             horizon=horizon,
             n_folds=n_folds,
             exog_forecast_cache=shared_cache,
-            trial_label=f"[{target_col}] {model_type} trial {i}",
+            trial_label=f"[{target_col}] lgbm trial {i}",
         )
 
         log(
-            f"[{target_col}] {model_type} trial {i}/{len(candidates)} done "
+            f"[{target_col}] lgbm trial {i}/{len(candidates)} done "
             f"in {time.perf_counter() - t_trial:.1f}s | "
             f"rmse={metrics['rmse']:.2f}, mae={metrics['mae']:.2f}, r2={metrics['r2']:.4f}"
         )
@@ -1163,19 +1256,128 @@ def tune_model(
 
 
 
-def blend_search(y_true: np.ndarray, pred_a: np.ndarray, pred_b: np.ndarray) -> tuple[float, dict[str, float]]:
-    best_w = 0.5
-    best_m = {"mae": float("inf"), "rmse": float("inf"), "r2": -float("inf")}
+def get_model_importance_map(model, feature_cols: list[str]) -> dict[str, float]:
+    if not hasattr(model, "feature_importances_"):
+        return {}
+    raw = np.asarray(getattr(model, "feature_importances_"), dtype=float).reshape(-1)
+    if len(raw) != len(feature_cols):
+        return {}
+    return {c: float(v) for c, v in zip(feature_cols, raw)}
 
-    for w in np.arange(0.0, 1.0001, 0.05):
-        p = w * pred_a + (1.0 - w) * pred_b
-        m = metric_pack(y_true, p)
-        better = (m["rmse"] < best_m["rmse"]) or (np.isclose(m["rmse"], best_m["rmse"]) and m["mae"] < best_m["mae"])
-        if better:
-            best_w = float(round(w, 2))
-            best_m = m
 
-    return best_w, best_m
+def auto_select_driver_cols(
+    train_df: pd.DataFrame,
+    target_col: str,
+    driver_cols: list[str],
+    lag_cols: list[int],
+    roll_windows: list[int],
+    horizon: int,
+    seed: int,
+    exog_forecast_cache: dict[tuple[int, int, int, str], np.ndarray] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    if len(driver_cols) <= AUTO_DRIVER_MIN_KEEP:
+        return list(driver_cols), {
+            "enabled": True,
+            "accepted": False,
+            "reason": "too_few_drivers",
+            "selected_count": len(driver_cols),
+            "original_count": len(driver_cols),
+        }
+
+    X_full, y_full = build_target_training_matrix(train_df, target_col, driver_cols, lag_cols, roll_windows)
+    probe_model, probe_backend = try_build_lgbm({}, seed=seed + 997)
+    if not probe_backend.startswith("lightgbm"):
+        return list(driver_cols), {
+            "enabled": True,
+            "accepted": False,
+            "reason": "lgbm_unavailable",
+            "selected_count": len(driver_cols),
+            "original_count": len(driver_cols),
+        }
+
+    probe_model.fit(X_full, y_full)
+    importance_map = get_model_importance_map(probe_model, X_full.columns.tolist())
+    if not importance_map:
+        return list(driver_cols), {
+            "enabled": True,
+            "accepted": False,
+            "reason": "importance_unavailable",
+            "selected_count": len(driver_cols),
+            "original_count": len(driver_cols),
+        }
+
+    driver_importance = {c: float(importance_map.get(c, 0.0)) for c in driver_cols}
+    ranked = sorted(driver_cols, key=lambda c: (driver_importance[c], c), reverse=True)
+
+    min_keep = max(AUTO_DRIVER_MIN_KEEP, int(np.ceil(len(driver_cols) * AUTO_DRIVER_KEEP_RATIO)))
+    min_keep = min(min_keep, len(driver_cols))
+    positive = [c for c in ranked if driver_importance[c] > 0]
+    candidate = positive if len(positive) >= min_keep else ranked[:min_keep]
+
+    if len(candidate) >= len(driver_cols):
+        return list(driver_cols), {
+            "enabled": True,
+            "accepted": False,
+            "reason": "no_prunable_drivers",
+            "selected_count": len(driver_cols),
+            "original_count": len(driver_cols),
+        }
+
+    builder = lambda p: try_build_lgbm({}, seed=seed + 131)
+    shared_cache = exog_forecast_cache if exog_forecast_cache is not None else {}
+
+    log(f"[{target_col}] Driver auto-select: quick CV baseline with {len(driver_cols)} drivers")
+    base_metrics, _, _ = walk_forward_cv_target(
+        train_df=train_df,
+        target_col=target_col,
+        driver_cols=driver_cols,
+        lag_cols=lag_cols,
+        roll_windows=roll_windows,
+        build_model_fn=builder,
+        params={},
+        horizon=horizon,
+        n_folds=1,
+        exog_forecast_cache=shared_cache,
+        trial_label=f"[{target_col}] fs-baseline",
+    )
+
+    log(f"[{target_col}] Driver auto-select: quick CV candidate with {len(candidate)} drivers")
+    cand_metrics, _, _ = walk_forward_cv_target(
+        train_df=train_df,
+        target_col=target_col,
+        driver_cols=candidate,
+        lag_cols=lag_cols,
+        roll_windows=roll_windows,
+        build_model_fn=builder,
+        params={},
+        horizon=horizon,
+        n_folds=1,
+        exog_forecast_cache=shared_cache,
+        trial_label=f"[{target_col}] fs-candidate",
+    )
+
+    non_degrade = (
+        cand_metrics["rmse"] <= base_metrics["rmse"] * (1.0 + AUTO_DRIVER_CV_TOL)
+        and cand_metrics["mae"] <= base_metrics["mae"] * (1.0 + AUTO_DRIVER_CV_TOL)
+        and cand_metrics["r2"] >= base_metrics["r2"] - AUTO_DRIVER_CV_TOL
+    )
+
+    selected = candidate if non_degrade else list(driver_cols)
+    report = {
+        "enabled": True,
+        "accepted": bool(non_degrade),
+        "reason": "cv_non_degrade" if non_degrade else "cv_degrade",
+        "original_count": len(driver_cols),
+        "selected_count": len(selected),
+        "dropped_count": int(len(driver_cols) - len(selected)),
+        "base_metrics": base_metrics,
+        "candidate_metrics": cand_metrics,
+        "driver_importance_top20": [
+            {"feature": c, "importance": float(driver_importance[c])}
+            for c in ranked[:20]
+        ],
+    }
+    return selected, report
 
 
 # -----------------------------
@@ -1183,10 +1385,14 @@ def blend_search(y_true: np.ndarray, pred_a: np.ndarray, pred_b: np.ndarray) -> 
 # -----------------------------
 
 
-def build_driver_forecasts(train_df: pd.DataFrame, future_dates: pd.Series) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+def build_driver_forecasts(
+    train_df: pd.DataFrame,
+    future_dates: pd.Series,
+    driver_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, object]]]:
     fourier_cols = [c for c in train_df.columns if c.startswith("sin_") or c.startswith("cos_")]
     blocked = set(CALENDAR_BASE_COLS + fourier_cols)
-    driver_cols = [
+    all_driver_cols = [
         c
         for c in train_df.columns
         if c
@@ -1199,6 +1405,12 @@ def build_driver_forecasts(train_df: pd.DataFrame, future_dates: pd.Series) -> t
         and not c.startswith("lag_")
         and not c.startswith("roll_")
     ]
+    if driver_cols is None:
+        driver_cols = all_driver_cols
+    else:
+        driver_cols = [c for c in driver_cols if c in all_driver_cols]
+    if not driver_cols:
+        raise ValueError("No driver columns available for forecasting.")
 
     horizon = len(future_dates)
     pred_df = pd.DataFrame({"Date": pd.to_datetime(future_dates)})
@@ -1235,15 +1447,30 @@ def fit_and_forecast_target(
     roll_windows = [7, 14, 28, 56, 84]
     shared_cache = exog_forecast_cache if exog_forecast_cache is not None else {}
 
-    # Tune Model A (LightGBM / fallback)
-    log(f"[{target_col}] Tuning model A (lgbm)")
-    p_a, m_a, y_a_true, y_a_pred, backend_a = tune_model(
+    driver_cols, driver_select_report = auto_select_driver_cols(
         train_df=train_df,
         target_col=target_col,
         driver_cols=driver_cols,
         lag_cols=lag_cols,
         roll_windows=roll_windows,
-        model_type="lgbm",
+        horizon=horizon,
+        seed=seed,
+        exog_forecast_cache=shared_cache,
+    )
+    future_driver_df = future_driver_df[["Date"] + driver_cols].copy()
+    log(
+        f"[{target_col}] Driver auto-select result: {len(driver_cols)} drivers kept "
+        f"(accepted={driver_select_report.get('accepted', False)})"
+    )
+
+    # Tune LightGBM and compare against seasonal baseline.
+    log(f"[{target_col}] Tuning LightGBM")
+    p_lgbm, m_lgbm, y_true_lgbm, y_pred_lgbm, backend_lgbm = tune_model(
+        train_df=train_df,
+        target_col=target_col,
+        driver_cols=driver_cols,
+        lag_cols=lag_cols,
+        roll_windows=roll_windows,
         horizon=horizon,
         n_folds=2,
         n_trials=n_trials,
@@ -1251,107 +1478,143 @@ def fit_and_forecast_target(
         exog_forecast_cache=shared_cache,
     )
 
-    # Tune Model B (CatBoost / fallback)
-    log(f"[{target_col}] Tuning model B (cat)")
-    p_b, m_b, y_b_true, y_b_pred, backend_b = tune_model(
+    # Compare against seasonal baseline and pick best strategy by full CV ranking.
+    m_seasonal, y_true_seasonal, y_pred_seasonal = seasonal_cv_target(
         train_df=train_df,
         target_col=target_col,
-        driver_cols=driver_cols,
-        lag_cols=lag_cols,
-        roll_windows=roll_windows,
-        model_type="cat",
         horizon=horizon,
         n_folds=2,
-        n_trials=n_trials,
-        seed=seed + 1,
-        exog_forecast_cache=shared_cache,
     )
-
-    # Align y_true arrays (they should match by split design)
-    y_ref = y_a_true if len(y_a_true) > 0 else y_b_true
-    if len(y_ref) == 0:
-        blend_w = 0.5
-        blend_metrics = {"mae": float("nan"), "rmse": float("nan"), "r2": float("nan")}
-        blend_rank = {"model_a": float("nan"), "model_b": float("nan"), "blend": float("nan")}
-        selected_strategy = "blend"
+    blend_weight = 1.0
+    if len(y_true_lgbm) == len(y_pred_lgbm) == len(y_pred_seasonal) and len(y_true_lgbm) > 0:
+        blend_weight, m_blend, _ = best_linear_blend(y_true_lgbm, y_pred_lgbm, y_pred_seasonal)
     else:
-        # If sizes mismatch unexpectedly, truncate to min.
-        n = min(len(y_a_pred), len(y_b_pred), len(y_ref))
-        blend_w_candidate, blend_metrics = blend_search(y_ref[:n], y_a_pred[:n], y_b_pred[:n])
-        model_a_metrics = metric_pack(y_ref[:n], y_a_pred[:n])
-        model_b_metrics = metric_pack(y_ref[:n], y_b_pred[:n])
-        rank_map = mean_rank_3metrics(
-            {
-                "model_a": model_a_metrics,
-                "model_b": model_b_metrics,
-                "blend": blend_metrics,
-            }
-        )
-        blend_rank = rank_map
+        m_blend = m_lgbm
 
-        if rank_map["blend"] < min(rank_map["model_a"], rank_map["model_b"]):
-            blend_w = blend_w_candidate
-            selected_strategy = "blend"
-        elif rank_map["model_a"] <= rank_map["model_b"]:
-            blend_w = 1.0
-            blend_metrics = model_a_metrics
-            selected_strategy = "model_a_only"
-        else:
-            blend_w = 0.0
-            blend_metrics = model_b_metrics
-            selected_strategy = "model_b_only"
+    cv_metric_map = {
+        "lgbm": m_lgbm,
+        "seasonal": m_seasonal,
+        "blend": m_blend,
+    }
+    cv_rank = mean_rank_3metrics(cv_metric_map)
+    best_key = min(cv_rank, key=lambda k: cv_rank[k])
+    selected_strategy = {
+        "lgbm": "lgbm_only",
+        "seasonal": "seasonal_only",
+        "blend": "blend_lgbm_seasonal",
+    }[best_key]
 
-    # Refit full models
-    log(f"[{target_col}] Refit full models and forecast horizon")
+    # Refit full model
+    log(f"[{target_col}] Refit LightGBM and forecast horizon")
     X_full, y_full = build_target_training_matrix(train_df, target_col, driver_cols, lag_cols, roll_windows)
     feature_cols = X_full.columns.tolist()
 
-    model_a, _ = try_build_lgbm(p_a, seed=seed)
-    model_b, _ = try_build_catboost(p_b, seed=seed + 1)
-    model_a.fit(X_full, y_full)
-    model_b.fit(X_full, y_full)
+    model_lgbm, _ = try_build_lgbm(p_lgbm, seed=seed)
+    model_lgbm.fit(X_full, y_full)
 
     # Forecast horizon using recursive path.
     future_df = future_driver_df[["Date"] + driver_cols].copy().sort_values("Date")
-    p_a_future = recursive_target_predict(
+    pred = recursive_target_predict(
         history_df=train_df[["Date", target_col] + driver_cols],
         future_df=future_df,
         target_col=target_col,
-        model=model_a,
+        model=model_lgbm,
         driver_cols=driver_cols,
         lag_cols=lag_cols,
         roll_windows=roll_windows,
         feature_cols=feature_cols,
     )
-    p_b_future = recursive_target_predict(
-        history_df=train_df[["Date", target_col] + driver_cols],
-        future_df=future_df,
-        target_col=target_col,
-        model=model_b,
-        driver_cols=driver_cols,
-        lag_cols=lag_cols,
-        roll_windows=roll_windows,
-        feature_cols=feature_cols,
+    pred_lgbm = np.clip(pred, 0, None)
+    pred_seasonal = seasonal_naive_recursive(
+        history=train_df[target_col].astype(float).values,
+        history_dates=train_df["Date"],
+        future_dates=future_df["Date"],
     )
+    if selected_strategy == "seasonal_only":
+        pred = np.clip(pred_seasonal, 0, None)
+    elif selected_strategy == "blend_lgbm_seasonal":
+        pred = np.clip(blend_weight * pred_lgbm + (1.0 - blend_weight) * pred_seasonal, 0, None)
+    else:
+        pred = pred_lgbm
 
-    pred = blend_w * p_a_future + (1.0 - blend_w) * p_b_future
-    pred = np.clip(pred, 0, None)
+    selected_cv = {
+        "lgbm_only": m_lgbm,
+        "seasonal_only": m_seasonal,
+        "blend_lgbm_seasonal": m_blend,
+    }[selected_strategy]
 
     info = {
         "target": target_col,
-        "model_a_backend": backend_a,
-        "model_b_backend": backend_b,
-        "model_a_params": p_a,
-        "model_b_params": p_b,
-        "model_a_cv": m_a,
-        "model_b_cv": m_b,
-        "blend_weight_model_a": blend_w,
-        "blend_cv": blend_metrics,
-        "cv_mean_rank": blend_rank,
+        "model_backend": backend_lgbm,
+        "model_a_backend": backend_lgbm,
+        "model_b_backend": "seasonal_naive_recursive",
+        "driver_cols_selected": driver_cols,
+        "driver_auto_select": driver_select_report,
+        "model_params": p_lgbm,
+        "model_cv": selected_cv,
+        "model_a_params": p_lgbm,
+        "model_b_params": {"type": "seasonal_naive_recursive"},
+        "model_a_cv": m_lgbm,
+        "model_b_cv": m_seasonal,
+        "blend_weight_model_a": blend_weight,
+        "blend_cv": m_blend,
+        "cv_mean_rank": {
+            "model_a": cv_rank["lgbm"],
+            "model_b": cv_rank["seasonal"],
+            "blend": cv_rank["blend"],
+        },
         "selected_strategy": selected_strategy,
     }
     log(f"[{target_col}] Completed in {time.perf_counter() - t_all:.1f}s")
     return pred, info
+
+
+def fit_and_forecast_cogs_from_ratio(
+    train_df: pd.DataFrame,
+    future_driver_df: pd.DataFrame,
+    revenue_pred: np.ndarray,
+    n_trials: int,
+    horizon: int,
+    seed: int,
+    exog_forecast_cache: dict[tuple[int, int, int, str], np.ndarray] | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    if len(revenue_pred) != len(future_driver_df):
+        raise ValueError("Revenue prediction length must match COGS horizon length.")
+
+    work_train = train_df.copy()
+    work_future = future_driver_df.copy()
+
+    ratio_raw = work_train["COGS"].astype(float) / work_train["Revenue"].astype(float).replace(0.0, np.nan)
+    ratio_clean = ratio_raw.replace([np.inf, -np.inf], np.nan)
+    ratio_median = float(ratio_clean.median()) if ratio_clean.notna().any() else 0.7
+    work_train["COGS_ratio"] = ratio_clean.fillna(ratio_median).clip(lower=0.0, upper=3.0)
+
+    # Inject revenue level as a known input for ratio modeling.
+    work_train["revenue_level_input"] = work_train["Revenue"].astype(float)
+    work_future["revenue_level_input"] = np.asarray(revenue_pred, dtype=float)
+
+    ratio_pred, ratio_meta = fit_and_forecast_target(
+        train_df=work_train,
+        future_driver_df=work_future,
+        target_col="COGS_ratio",
+        n_trials=n_trials,
+        horizon=horizon,
+        seed=seed,
+        exog_forecast_cache=exog_forecast_cache,
+    )
+
+    cogs_pred = np.asarray(ratio_pred, dtype=float) * np.asarray(revenue_pred, dtype=float)
+    cogs_pred = np.clip(cogs_pred, 0.0, None)
+
+    info = {
+        **ratio_meta,
+        "target": "COGS",
+        "cogs_mode": "ratio_times_revenue_pred",
+        "ratio_target_col": "COGS_ratio",
+        "ratio_fill_median": ratio_median,
+        "cv_metric_space": "ratio",
+    }
+    return cogs_pred, info
 
 
 
@@ -1403,16 +1666,64 @@ def make_submission(sample_submission: pd.DataFrame, pred_revenue: np.ndarray, p
 
 
 
-def select_curated_drivers(available_cols: list[str], max_drivers: int = 35) -> list[str]:
-    selected = [c for c in BEST_DRIVER_CANDIDATES if c in available_cols]
-    if max_drivers > 0:
-        selected = selected[:max_drivers]
-    return selected
+def select_curated_drivers(
+    train_df: pd.DataFrame,
+    available_cols: list[str],
+    target_col: str = "Revenue",
+    max_drivers: int = 50,
+) -> list[str]:
+    clean_available = [c for c in available_cols if c in train_df.columns and c != "Date"]
+    if not clean_available:
+        return []
+
+    # Keep strong business drivers, then rank the rest by absolute correlation.
+    selected = [c for c in CORE_DRIVER_FEATURES if c in clean_available]
+    residual = [c for c in clean_available if c not in selected]
+
+    filtered_residual: list[str] = []
+    for c in residual:
+        if any(c.startswith(pfx) for pfx in NOISY_DRIVER_PREFIXES):
+            continue
+        s = train_df[c].astype(float)
+        if s.nunique(dropna=False) <= 1:
+            continue
+        filtered_residual.append(c)
+
+    y = train_df[target_col].astype(float)
+    corr_map: dict[str, float] = {}
+    for c in filtered_residual:
+        x = train_df[c].astype(float)
+        corr = x.corr(y)
+        corr_map[c] = abs(float(corr)) if pd.notna(corr) else 0.0
+
+    ranked = sorted(filtered_residual, key=lambda c: (corr_map.get(c, 0.0), c), reverse=True)
+    # Keep at least a broad context for tree models, but avoid very weak noise.
+    min_extra_keep = 12
+    corr_floor = 0.01
+    for c in ranked:
+        if max_drivers > 0 and len(selected) >= max_drivers:
+            break
+        if corr_map.get(c, 0.0) >= corr_floor or len(selected) < len(CORE_DRIVER_FEATURES) + min_extra_keep:
+            selected.append(c)
+
+    # De-duplicate while preserving order.
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in selected:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out[:max_drivers] if max_drivers > 0 else out
 
 
-def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> None:
+def run_pipeline(
+    base_dir: Path,
+    out_dir: Path,
+    n_trials: int,
+    seed: int,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_tag = f"t{n_trials}_s{seed}"
+    run_tag = f"{PIPELINE_CACHE_VERSION}_t{n_trials}_s{seed}"
     driver_cache_path = out_dir / f"driver_future_forecasts_{run_tag}.csv"
     driver_meta_path = out_dir / f"driver_model_selection_{run_tag}.json"
     rev_pred_cache = out_dir / f"pred_revenue_{run_tag}.npy"
@@ -1428,8 +1739,26 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
     mart = build_daily_feature_mart(bundle)
     mart_safe = apply_time_safety_shifts(mart)
 
-    # 2) Forecast drivers for test horizon
+    # 2) Select and forecast exogenous drivers for test horizon
     future_dates = bundle.sample_submission["Date"].sort_values().reset_index(drop=True)
+    all_exog_cols = [
+        c
+        for c in mart_safe.columns
+        if c not in ["Date", "Revenue", "COGS"]
+        and c not in CALENDAR_BASE_COLS
+        and not c.startswith("sin_")
+        and not c.startswith("cos_")
+        and not c.startswith("lag_")
+        and not c.startswith("roll_")
+    ]
+    exog_driver_cols = select_curated_drivers(
+        train_df=mart_safe,
+        available_cols=all_exog_cols,
+        target_col="Revenue",
+        max_drivers=50,
+    )
+    log(f"[Stage] Selected {len(exog_driver_cols)} driver candidates before forecasting")
+
     cache_valid = False
     if driver_cache_path.exists():
         log("[Stage] Loading cached driver forecasts...")
@@ -1438,8 +1767,10 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
             "Date" in driver_future_df.columns
             and len(driver_future_df) == len(future_dates)
             and pd.to_datetime(driver_future_df["Date"]).reset_index(drop=True).equals(pd.to_datetime(future_dates))
+            and all(c in driver_future_df.columns for c in exog_driver_cols)
         )
         if cache_valid:
+            driver_future_df = driver_future_df[["Date"] + exog_driver_cols].copy()
             if driver_meta_path.exists():
                 driver_meta = json.loads(driver_meta_path.read_text(encoding="utf-8"))
             else:
@@ -1452,6 +1783,7 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
         driver_future_df, driver_meta = build_driver_forecasts(
             train_df=mart_safe.drop(columns=["Revenue", "COGS"]).copy(),
             future_dates=future_dates,
+            driver_cols=exog_driver_cols,
         )
         driver_future_df.to_csv(driver_cache_path, index=False)
         pd.DataFrame(driver_meta).to_json(driver_meta_path, orient="records", indent=2)
@@ -1459,9 +1791,14 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
 
     # 3) Attach drivers to train set
     train_model_df = mart_safe.copy()
-    exog_driver_cols = [c for c in driver_future_df.columns if c != "Date"]
-    exog_driver_cols = select_curated_drivers(exog_driver_cols, max_drivers=35)
     driver_future_df = driver_future_df[["Date"] + exog_driver_cols].copy()
+
+    revenue_driver_cols = list(exog_driver_cols)
+    cogs_driver_cols = list(exog_driver_cols)
+    log(
+        f"[Stage] Driver counts by target: "
+        f"Revenue={len(revenue_driver_cols)}, COGS={len(cogs_driver_cols)}"
+    )
 
     # ensure same driver columns in train
     missing_driver_cols = [c for c in exog_driver_cols if c not in train_model_df.columns]
@@ -1470,17 +1807,26 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
 
     # 4) Target models
     horizon = len(future_dates)
-    horizon_signature = {
+    revenue_future_driver_df = driver_future_df[["Date"] + revenue_driver_cols].copy()
+    cogs_future_driver_df = driver_future_df[["Date"] + cogs_driver_cols].copy()
+
+    base_horizon_signature = {
         "len": int(horizon),
         "start": str(pd.to_datetime(future_dates).min().date()),
         "end": str(pd.to_datetime(future_dates).max().date()),
+    }
+    rev_horizon_signature = {**base_horizon_signature, "driver_cols": revenue_driver_cols}
+    cogs_horizon_signature = {
+        **base_horizon_signature,
+        "driver_cols": cogs_driver_cols,
+        "cogs_mode": "ratio_times_revenue_pred_v1",
     }
     shared_exog_forecast_cache: dict[tuple[int, int, int, str], np.ndarray] = {}
     if rev_pred_cache.exists() and rev_meta_cache.exists():
         cached = load_cached_prediction(rev_pred_cache, expected_len=horizon)
         rev_meta_cached = load_cached_meta_dict(rev_meta_cache)
         rev_meta_valid = (
-            rev_meta_cached is not None and rev_meta_cached.get("horizon_signature") == horizon_signature
+            rev_meta_cached is not None and rev_meta_cached.get("horizon_signature") == rev_horizon_signature
         )
         if cached is not None and rev_meta_valid:
             log("[Stage] Loading cached Revenue prediction...")
@@ -1490,14 +1836,14 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
             log("[Stage] Revenue cache invalid (shape/NaN/Inf/horizon signature). Re-training...")
             pred_rev, rev_meta = fit_and_forecast_target(
                 train_df=train_model_df,
-                future_driver_df=driver_future_df,
+                future_driver_df=revenue_future_driver_df,
                 target_col="Revenue",
                 n_trials=n_trials,
                 horizon=horizon,
                 seed=seed,
                 exog_forecast_cache=shared_exog_forecast_cache,
             )
-            rev_meta["horizon_signature"] = horizon_signature
+            rev_meta["horizon_signature"] = rev_horizon_signature
             np.save(rev_pred_cache, pred_rev)
             rev_meta_cache.write_text(json.dumps(rev_meta, indent=2), encoding="utf-8")
             log(f"[Checkpoint] Saved Revenue cache: {rev_pred_cache}")
@@ -1505,14 +1851,14 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
         log(f"[Stage] Training Revenue models (trials={n_trials})...")
         pred_rev, rev_meta = fit_and_forecast_target(
             train_df=train_model_df,
-            future_driver_df=driver_future_df,
+            future_driver_df=revenue_future_driver_df,
             target_col="Revenue",
             n_trials=n_trials,
             horizon=horizon,
             seed=seed,
             exog_forecast_cache=shared_exog_forecast_cache,
         )
-        rev_meta["horizon_signature"] = horizon_signature
+        rev_meta["horizon_signature"] = rev_horizon_signature
         np.save(rev_pred_cache, pred_rev)
         rev_meta_cache.write_text(json.dumps(rev_meta, indent=2), encoding="utf-8")
         log(f"[Checkpoint] Saved Revenue cache: {rev_pred_cache}")
@@ -1521,7 +1867,7 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
         cached = load_cached_prediction(cogs_pred_cache, expected_len=horizon)
         cogs_meta_cached = load_cached_meta_dict(cogs_meta_cache)
         cogs_meta_valid = (
-            cogs_meta_cached is not None and cogs_meta_cached.get("horizon_signature") == horizon_signature
+            cogs_meta_cached is not None and cogs_meta_cached.get("horizon_signature") == cogs_horizon_signature
         )
         if cached is not None and cogs_meta_valid:
             log("[Stage] Loading cached COGS prediction...")
@@ -1529,31 +1875,31 @@ def run_pipeline(base_dir: Path, out_dir: Path, n_trials: int, seed: int) -> Non
             cogs_meta = cogs_meta_cached if cogs_meta_cached is not None else {}
         else:
             log("[Stage] COGS cache invalid (shape/NaN/Inf/horizon signature). Re-training...")
-            pred_cogs, cogs_meta = fit_and_forecast_target(
+            pred_cogs, cogs_meta = fit_and_forecast_cogs_from_ratio(
                 train_df=train_model_df,
-                future_driver_df=driver_future_df,
-                target_col="COGS",
+                future_driver_df=cogs_future_driver_df,
+                revenue_pred=pred_rev,
                 n_trials=n_trials,
                 horizon=horizon,
                 seed=seed + 100,
                 exog_forecast_cache=shared_exog_forecast_cache,
             )
-            cogs_meta["horizon_signature"] = horizon_signature
+            cogs_meta["horizon_signature"] = cogs_horizon_signature
             np.save(cogs_pred_cache, pred_cogs)
             cogs_meta_cache.write_text(json.dumps(cogs_meta, indent=2), encoding="utf-8")
             log(f"[Checkpoint] Saved COGS cache: {cogs_pred_cache}")
     else:
         log(f"[Stage] Training COGS models (trials={n_trials})...")
-        pred_cogs, cogs_meta = fit_and_forecast_target(
+        pred_cogs, cogs_meta = fit_and_forecast_cogs_from_ratio(
             train_df=train_model_df,
-            future_driver_df=driver_future_df,
-            target_col="COGS",
+            future_driver_df=cogs_future_driver_df,
+            revenue_pred=pred_rev,
             n_trials=n_trials,
             horizon=horizon,
             seed=seed + 100,
             exog_forecast_cache=shared_exog_forecast_cache,
         )
-        cogs_meta["horizon_signature"] = horizon_signature
+        cogs_meta["horizon_signature"] = cogs_horizon_signature
         np.save(cogs_pred_cache, pred_cogs)
         cogs_meta_cache.write_text(json.dumps(cogs_meta, indent=2), encoding="utf-8")
         log(f"[Checkpoint] Saved COGS cache: {cogs_pred_cache}")
@@ -1603,4 +1949,9 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    run_pipeline(args.base_dir, args.out_dir, n_trials=args.n_trials, seed=args.seed)
+    run_pipeline(
+        args.base_dir,
+        args.out_dir,
+        n_trials=args.n_trials,
+        seed=args.seed,
+    )
