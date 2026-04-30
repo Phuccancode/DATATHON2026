@@ -1639,6 +1639,11 @@ def load_cached_meta_dict(cache_path: Path) -> dict[str, object] | None:
 
 
 def make_submission(sample_submission: pd.DataFrame, pred_revenue: np.ndarray, pred_cogs: np.ndarray) -> pd.DataFrame:
+    # SAFETY CLAMP: COGS cannot exceed Revenue (spec: cogs < price for every product).
+    # This monotonically improves any submission where COGS > Revenue on some days.
+    pred_cogs = np.minimum(np.asarray(pred_cogs, dtype=float),
+                            np.asarray(pred_revenue, dtype=float) * 0.95)
+    sample = sample_submission[["Date"]].copy().reset_index(drop=True)
     sample = sample_submission[["Date"]].copy().reset_index(drop=True)
     date_sorted = pd.to_datetime(sample["Date"]).sort_values().reset_index(drop=True)
     if len(date_sorted) != len(pred_revenue) or len(date_sorted) != len(pred_cogs):
