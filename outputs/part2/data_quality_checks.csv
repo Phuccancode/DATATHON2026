@@ -1,2 +1,0 @@
-sales_rows,revenue_mae_vs_sales,revenue_max_abs_err,cogs_mae_vs_sales,cogs_max_abs_err,inventory_stockout_flag_mean,inventory_overstock_flag_mean,inventory_reorder_flag_mean,inventory_reorder_flag_nunique
-3833.0,2.334077089068599e-11,1.862645149230957e-09,0.002460054697207618,0.00499926891643554,0.6734111242053546,0.7625607914087008,0.0,1.0
